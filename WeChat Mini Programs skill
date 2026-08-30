@@ -1,0 +1,150 @@
+---
+name: wechat-chain-mall-rebuild
+description: Use when 从零搭建/复刻连锁零售微信商城小程序(云开发全栈教程).
+---
+
+# 连锁零售微信商城小程序 · 从零复刻教程（云开发版）
+
+> 一份教程型 skill：教你从零搭建一个"连锁门店 + 线上商城"的微信小程序全栈系统。
+> 不含任何真实业务数据；所有数据（商品/门店/卡库/密钥）复刻时从原项目或控制台导出。
+
+## When to Use
+- 从零搭建连锁零售类微信商城小程序（多门店、自提+配送、会员积分）
+- 把同类项目克隆到新 AppID / 新云环境 / 新商户号
+- 学习"小程序 + 云开发 + H5 后台 + 门店打印"的完整架构怎么搭
+
+## 你将建成的系统
+```
+用户(微信小程序) → 云函数(30个) → 云数据库(21集合) + 云存储(图片)
+                → 微信支付V3 / 同城跑腿API / 订阅消息 / 内容安全
+H5品牌站+管理后台(React+Vite静态站) → 服务器PHP中转 → 云函数网关
+门店Windows打票机 ← 本地打印服务(127.0.0.1:8899) ← H5后台发现新订单即打印
+```
+技术栈：原生微信小程序（非 Taro）+ 微信云开发（云函数/云数据库/云存储），
+前端无构建；H5 用 React18+Vite+Tailwind 构建后静态托管。
+
+## 第一步：目录骨架
+```
+app.js/json/wxss          全局：登录、门店定位、数据加载、设计变量
+pages/  31页 = 5 Tab(首页/分类/购物车/会员/我的) + 交易链 + 个人中心 + 门店管理端
+components/  qty-modal(全局注册) + loading-lottie
+utils/  data(商品兜底) stores(门店) price(价格) cloud(数据库封装) membership(会员)
+        pinyin-search imgutil(图片直链) images avatars 地图SDK libs/pinyin-pro
+services/  cart(跨店购物车) coupons
+cloudfunctions/  30个云函数（清单见下）
+h5-app/  React 品牌站+管理后台源码（构建产物发服务器）
+print-server/  Node ESC/POS 热敏打印服务
+```
+app.json 要点：navigationStyle=custom（自算 statusBarHeight）；导航栏用纯色品牌色；
+lazyCodeLoading=requiredComponents；声明定位权限 scope.userLocation 与
+requiredPrivateInfos；packOptions.ignore 排除文档目录控包体积；
+不对外开放的页面（如发票）可以不注册进 pages，当作隐藏功能。
+
+## 第二步：云函数（30 个，统一 action 路由）
+写法约定：exports.main(event) → switch(event.action)，返回 {ok, data|err}。
+
+| 函数 | 职责 | 关键 actions |
+|---|---|---|
+| adminApi | 后台核心（最大，2000+行） | login、商品 CRUD/CSV 导出导入、订单/退货/库存、店员 CRUD、开关店、公告/活动/广告/榜单 CRUD + pub* 公开读、优惠券、积分商品、提货卡全生命周期(卡种/批量制卡/激活/核销/导出/流水/横幅)、发票、uploadImage |
+| productApi | 商品(客户端) | list/get/add/update/delete/banner |
+| inventoryApi | 库存 | get/list/batchGet/set/adjust/addBack/deduct/deductBatch/findStores |
+| payApi | 微信支付 V3 | query/refund(幂等)/courierFee/queryCourierFee |
+| payNotify | 支付回调 | 验签→改单→扣库存→加积分→发通知 |
+| orderApi | 订单(店员侧) | getDetail/listByStore/setVerifyCode/uploadImages |
+| staffApi | 店员 | add/remove/toggle/list/setStore/setNickname/myStore/listOrders/updateOrder/canSeed/seedAdmin |
+| returnApi | 退货审核 | list/approve/reject/receive |
+| pointsApi | 积分 | list/exchange/myExchanges/logPoints/myLogs/deductForOrder/refundForOrder |
+| reviewsApi | 评价+内容安全 | submit/byProduct/checkOrder/mediaCheck/msgCheck/riskCheck |
+| uuptApi | 同城跑腿 | price/create/quickCreate/cancel/cancelFee/account/rechargeUrl/detail/track/dispatchOrder/gratuity/sync |
+| uuptCallback | 跑腿回调 | 更新订单状态 |
+| serviceApi | 服务号绑定/通知 | bind/getBind/getOAuthUrl/oauth/genQrCode/sendTemplate/notifyNewOrder/notifyReject |
+| sendSubscribeMsg | 订阅消息 | userOrderStatus/userRefund/userAppointment/staffNewOrder/staffReturn/staffAppointment |
+| storeApi | 开关店 | getCloseTimes/setCloseTime |
+| invoiceApi | 发票(隐藏) | myAvailableOrders/submit/myList/h5Issue/h5List |
+| 工具类 | getOpenid / phoneLogin / mpVerify / reverseGeocode / syncData / importProducts / batchImport / priceUpdate / ordersBackfill / fixSpaceFiles / initDB / h5admin(网关转发 adminApi) | — |
+
+## 第三步：云数据库（21 集合）
+users / staff / wine_products / inventory / orders / return_requests / reviews /
+coupon_templates / points_products / points_log / points_exchanges / rankings /
+ads / notices / activities / card_banner / cards / card_kinds / card_trades /
+invoices / store_settings
+
+要点：orders 集合权限设"仅创建者可读写"→ 店员接单必须走 staffApi/orderApi
+云函数中转，不能直接前端查。
+
+## 第四步：核心业务规则（照抄级，改一处全盘皆错）
+1. **价格三分支**（utils/price.js 唯一出口）：限时价在时间窗内→用限时价，
+   否则用会员价；划线价仅当原价>生效价；整箱=规格价(packSpecs)。
+   显示/加购/下单/结算全部走同一个函数。
+2. **库存语义**：0=无货、>0=有货、无记录=售罄；扣减只在支付成功回调里
+   批量扣(不足整单拒绝)；整箱按瓶扣=数量×规格容量；生效门店=手选>定位>默认首店。
+3. **购物车跨店**：每条目绑 storeId，key=商品+规格+店；按当前店过滤/计数/结算；
+   旧数据(无店)归默认首店不漂移；结算一店一结(分组链式下单)；切店 onShow 同步。
+4. **权限模型**：超管=全店+店员管理；卡/广告/券/积分商品/商品/位置/网页组仅超管；
+   绑店店长=本店订单/退货/库存/打烊/提货卡/打票机；无店店长判超管；面板强制本店。
+   H5 登录：超管用专用账号(手机号留空)，管理员/店员=手机号+密码。
+5. **积分/会员**：指定高价品类按名称关键词 1元=1分，其余 1元=5分（比例可配置）；
+   等级按累计积分分 3 档（普通/VIP/钻石）；兑换走 pointsApi；退款扣回积分。
+6. **退款**：未发货全额含运费；已发货退商品不退运费；refundStatus 状态机幂等防重。
+7. **评价**：一单一品一条防重；文本+图片内容安全检查，仅 risky 才拦；
+   展示评分=(5+平均分)/2。
+8. **图片**：cloud fileID 一律转 https://<appid>.tcb.qcloud.la/<路径> 永久直链
+   （前后端同一套转换函数）；中文/空格必须 URL 编码，真机对未编码中文 URL 不稳；
+   主图/详情图各≤20 张；编辑未传图保留原图；404=重传；451=云开发欠费冻结(充值恢复)。
+9. **同城跑腿**：起步价含基础公里数+超程单价+封顶，必须云端复算不信任前端；
+   退货走跑腿=用户预付运费，勿到付。
+10. **公开接口**：公告/活动/广告/榜单的 C 端读走 pub* action（放鉴权之前），
+    前端切 tab 时拉取，失败回落静态兜底数据。
+11. **提货卡**：卡号搜索用后端正则进 where（勿只 filter 当前页）；卡密用环境变量
+    里的密钥加密；状态机 未激活→已激活→已核销/已冻结。
+12. **订阅消息触发点**：下单→店员新单；订单状态变→用户；退款→双端。
+13. **拼音搜索**：pinyin-pro vendor 免构建；给商品预生成 _py(全拼)/_pys(首字母)；
+    元素级幂等(判断 p._py，勿用全局标志，异步换数据会漏)；云缓存+节流刷新。
+
+## 第五步：页面（31 个）
+- 5 Tab：首页(定位/轮播广告/热销/榜单入口/弹窗广告/加购飞入动画)、分类(双级分类+
+  搜索筛选+门店切换)、购物车(跨店分组勾选/券/自提弹窗)、会员(等级卡+积分进度+领券)、
+  我的(角色徽章/系统头像/各功能入口)
+- 交易链：商品详情(主图轮播+详情图分离/多店库存/售罄弹窗/评价聚合)、结算(分组下单/
+  满额免运费/券/跑腿费)、待付款(拉起支付/倒计时)、待发货、待收货、订单详情(状态机/
+  核销码/跑腿轨迹地图)、订单跟踪、跑腿轨迹
+- 个人/营销：地址 CRUD、优惠券、积分、积分商城、收藏、足迹、资料编辑、邀请、
+  活动页、门店列表、写评价、评价列表、退换货(门店/快递/跑腿三方式)、榜单
+- 管理端：店员端(30s 轮询接单/状态流转/核销码)、店长端(订单/库存/店员/打烊/退货
+  多 tab)、退货审核、服务号绑定
+- 隐藏：发票申请/列表（不注册进 app.json）
+
+## 第六步：H5 品牌站 + 管理后台
+React+Vite+Tailwind，单页多 tab 懒加载：首页/公告/活动/门店(地图)/管理后台/页脚(ICP)。
+后台用专用 PHP 中转云函数网关（服务器上的中转文件不在仓库内，部署时注意保留）。
+角色控制：超管见全局模块，店长只见本店。后台轮询到新订单→POST 本机打印服务。
+
+## 第七步：门店打印服务
+Node 本地 http 服务(8899)：POST /print 按门店映射选打印机→ESC/POS→自动出票；
+GET /printers 枚举、GET/POST /config 门店→打印机映射、POST /test、GET /status。
+配开机自启+保活脚本；先停旧服务防端口冲突；bat 中文存 GBK；ps1 用 Unrestricted。
+
+## 第八步：部署与配置
+- 云函数按依赖序部署：getOpenid→initDB→productApi→inventoryApi→adminApi→
+  payApi/payNotify→orderApi/staffApi→pointsApi→reviewsApi→returnApi→
+  serviceApi/sendSubscribeMsg→uuptApi/uuptCallback→invoiceApi→工具函数
+- 环境变量分组：支付四件套 / 跑腿五件套 / 服务号 / 超管账号密码 / 卡密加密钥 /
+  各后台管理口令（值从原环境或商户平台抄，勿写进代码和文档）
+- 微信支付 V3：商户私钥+序列号+APIv3 密钥；支付回调路由指向 payNotify
+- 订阅消息模板 ID 配在 sendSubscribeMsg
+- 地图 Key 注入 H5 页面
+- H5 服务器：静态托管构建产物+PHP 中转；只传产物目录勿整目录覆盖
+
+## 易错点（血泪清单）
+- wxss 改前重读磁盘+括号配平；测试改真实数据先记原值用完还原
+- 门店 id 历史跳号是数据迁移结果，勿重排
+- React context 漏 value 传参→页面白屏（tsc 过、运行时崩），加字段后 grep value 段
+- 云数据库客户端 limit 100→skip 分页；_.in 限 20→分批；users 查 openid 兼容 _openid
+- 商品 CSV 导入=按 id 匹配更新、无删除语义，导出文件即导入模板
+- 本地打印/提示音走 127.0.0.1 仅门店本机有效
+- 后台云函数新 action 放主 try 内，否则部署后 404
+
+## 验证清单
+- 开发者工具每批改动即编译；真机下单全链路截图
+- 后台用超管+店长两种角色各验一遍权限边界
+- 支付/退款/跑腿沙箱全跑通再上线
