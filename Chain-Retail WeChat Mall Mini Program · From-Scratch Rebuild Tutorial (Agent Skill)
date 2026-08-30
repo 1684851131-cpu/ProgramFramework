@@ -1,0 +1,55 @@
+# Chain-Retail WeChat Mall Mini Program · From-Scratch Rebuild Tutorial (Agent Skill)
+
+A **tutorial-style AI Agent Skill** that distills the complete full-stack
+architecture of a "chain stores + online mall" WeChat mini program into a
+directly executable rebuild tutorial. Install it into any AI coding assistant
+(Hermes / Claude Code / Codex …) and it can build a production-grade system of
+the same kind from zero.
+
+> Pure tutorial — contains no real business data, accounts, or secrets.
+
+## What the System Looks Like
+
+```
+Customer (WeChat Mini Program) → Cloud Functions (30) → Cloud DB (21 collections) + Cloud Storage
+                               → WeChat Pay V3 / local courier API / subscribe messages / content safety
+H5 brand site + admin (React+Vite) → PHP relay → cloud function gateway
+In-store Windows receipt printer ← local print service (8899) ← auto-prints new orders
+```
+
+## What the Tutorial Covers
+
+| Module | Contents |
+|---|---|
+| Architecture | Directory skeleton, system topology, tech choices (native mini program + CloudBase, no self-hosted backend) |
+| Cloud functions | 30 functions with full action routing tables (admin / products / inventory / payments / orders / staff / returns / points / reviews / courier / subscribe messages / gift cards / invoices …) |
+| Database | 21-collection design and permission essentials (orders are creator-only → staff consoles must go through cloud functions) |
+| Business rules | Three-branch pricing, inventory semantics, cross-store cart, permission model, membership points, idempotent refunds, review dedup, permanent image URLs, courier pricing, gift-card state machine, pinyin search |
+| Pages | Specs for 31 pages grouped by flow (5 Tabs + transaction chain + personal center + store consoles + hidden pages) |
+| Peripheral systems | H5 brand site + admin, in-store ESC/POS thermal print service |
+| Deployment | Cloud-function dependency order, env-var groups, WeChat Pay V3, subscribe messages, server notes |
+| Pitfalls | 15+ hard-earned lessons (wxss braces, limit-100 pagination, _.in limit 20, GBK encoding, port conflicts …) |
+
+## Usage
+
+**As a Hermes skill**: place `SKILL.md` under
+`skills/wechat/wechat-chain-mall-rebuild/`, then tell the agent
+"build a chain-mall mini program following the tutorial".
+
+**As a Claude Code / Codex skill**: drop it into the project's
+`.claude/skills/` or `.agents/skills/` directory and invoke by name.
+
+**Plain reading**: open `SKILL.md` and follow Step 1 → Step 8 in order.
+
+## Files
+
+```
+SKILL.md      The tutorial (Chinese, canonical)
+SKILL.en.md   English translation (this skill, English)
+README.md     Repo introduction (Chinese)
+README.en.md  Repo introduction (English, this file)
+```
+
+## License
+
+MIT
