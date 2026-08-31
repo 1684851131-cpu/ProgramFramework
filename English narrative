@@ -10,7 +10,623 @@ the same kind from zero.
 
 ## What the System Looks Like
 
+```---
+name: wechat-chain-mall-rebuild
+description: Use when building a chain-retail WeChat mall mini program from scratch (CloudBase full-stack tutorial).
+---
+
+# Chain-Retail WeChat Mall Mini Program · One-Pass Build Tutorial (CloudBase Edition)
+
+> Goal: follow this tutorial and build the ENTIRE system in one pass, without
+> needing to ask for details. It contains only structure, contracts, rules and
+> process — **no real business data, accounts, or secrets**; data is imported
+> by you in Step 8.
+
+═══════════════════════════════════════════
+Chapter 0 · System Overview & Tech Choices
+═══════════════════════════════════════════
+
 ```
+Customer (WeChat Mini Program) → Cloud Functions (30) → Cloud DB (21 collections) + Cloud Storage (images)
+                               → WeChat Pay V3 / local courier API / subscribe messages / content safety
+H5 brand site + admin (React+Vite static) → server PHP relay → cloud gateway (h5admin → adminApi)
+In-store Windows receipt printer ← local print service (127.0.0.1:8899) ← H5 admin POSTs new orders
+```
+
+- Mini program: **native** (no Taro/uni-app), no build step, straight into
+  WeChat DevTools
+- Backend: WeChat CloudBase (Node.js cloud functions + MongoDB-style cloud DB
+  + cloud storage)
+- H5: React 18 + Vite + Tailwind v4, built to static files + one PHP relay file
+- Printing: a Node service on each store's Windows machine driving thermal
+  printers over ESC/POS
+
+═══════════════════════════════════════════
+Chapter 1 · Directory Skeleton (build in this order)
+═══════════════════════════════════════════
+
+```
+app.js / app.json / app.wxss / project.config.json / sitemap.json
+pages/           31 pages, each a folder xxx/{xxx.js, xxx.wxml, xxx.wxss, xxx.json}
+components/      qty-modal/  loading-lottie/
+utils/           data.js stores.js price.js cloud.js membership.js
+                 pinyin-search.js imgutil.js images.js avatars.js
+                 qqmap-wx-jssdk.js (map SDK)  libs/pinyin-pro.js (vendored pinyin)
+services/        cart.js coupons.js
+cloudfunctions/  30 cloud functions, each xxx/{index.js, package.json}
+h5-app/          React admin source (src/: App.tsx + context/ + components/ + data/)
+admin/           legacy static admin (optional, backup only)
+print-server/    print service (print-server.js + bat/ps1 scripts)
+images/          local placeholder.jpg etc.
+```
+
+═══════════════════════════════════════════
+Chapter 2 · The Global Trio (app.json / app.wxss / app.js)
+═══════════════════════════════════════════
+
+## 2.1 app.json (write exactly this structure)
+
+- pages array, 31 entries, in this order:
+  index, category, membership, profile, wine-detail, ranking, cart, coupons,
+  favorites, to-receive, to-ship, to-pay, address, browse-history, points,
+  edit-profile, return-exchange, return-audit, checkout, order-track,
+  points-mall, store-staff, store-admin, order-detail, uupt-track, invite,
+  service-bind, activity, stores, review-write, review-list
+  (each prefixed "pages/<name>/<name>")
+- Hidden pages invoice-apply / invoice-list are NOT registered in pages
+  (hidden feature — do not wire up)
+- window: navigationBarTitleText=brand name, navigationBarBackgroundColor=
+  solid brand blue (e.g. #0284c7 — the system nav bar MUST be a solid color),
+  navigationBarTextStyle=white, backgroundColor=#f5f6fa,
+  navigationStyle=custom
+- tabBar, 5 items: Home / Category / Cart / Membership / Profile;
+  color=#94a3b8, selectedColor=#1e3a8a, backgroundColor=#ffffff
+- usingComponents: { "qty-modal": "/components/qty-modal/qty-modal" }
+- lazyCodeLoading: "requiredComponents"
+- permission: { "scope.userLocation": { "desc": "Used for home-page
+  geolocation and nearby-store recommendation" } }
+- requiredPrivateInfos: ["chooseLocation", "getLocation", "chooseAddress"]
+- packOptions.ignore: docs folder and large files
+- sitemapLocation: sitemap.json
+
+## 2.2 app.wxss (global design tokens)
+
+```
+--font-sans: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif
+--font-serif: 'Noto Serif SC', Georgia, serif      /* membership card / ranking titles */
+--color-primary: #1e3a8a        /* brand deep blue: selected tab / primary buttons */
+--color-primary-container: #1e40af
+Page background #faf9fa; body text #1b1c1d; secondary text #434653; error #ba1a1a
+Base font-size 32rpx; line-height 1.5; global box-sizing: border-box
+```
+Visual language: home/category/detail = clean e-commerce (white cards,
+16–24rpx radius, light shadows); membership card banner = Memphis style
+(geometric blocks + dots + clashing colors); ranking page = pop-art narrative
+style (brand blue + halftone dots + black-edged hard shadows + clashing
+colors). Images always inside overflow:hidden containers; cart badge =
+position:absolute with an overflow:hidden parent.
+
+## 2.3 app.js (global layer)
+
+globalData fields (create every one):
+  defaultImage, usePlaceholderImages(false), activeScreen('HOME'),
+  isLoggedIn, hasUserInfo, username, avatarUrl, bio, phone,
+  favorites[], cartItems[], cardBanner(null), customizingItem(null),
+  wineProducts (= static fallback from data.js), menuItems, coupons[],
+  appliedCouponId(null), addresses[], historyItems[], points(0),
+  pointsTransactions[], dineInMode(null), systemInfo, statusBarHeight(0),
+  activeStore(null, current store), nearbyStore(null, geo store),
+  manualStore(false, manual pick beats geolocation)
+
+Required methods:
+  onLaunch (init cloud via wx.cloud.init, read system info to compute
+    statusBarHeight, checkLoginStatus, loadCloudData to overlay cloud products
+    onto local ones, locateNearestStore, checkPendingOrders, _handleInvite for
+    shared-entry)
+  getStockStore() / setStockStore() — effective store: manual > geo > default
+  checkLoginStatus / requireLogin / doLogin / doPhoneLogin /
+    _handleLoginSuccess / logout
+  loadUserData / loadCloudData / notifyDataReady
+  getMembershipInfo / addPoints
+  toggleFavorite / isFavorited
+  addToHistory / removeHistoryItem / clearAllHistory
+  onPageNotFound
+
+Login flow: wx.login silently gets code → getOpenid cloud function returns
+openid → store in Storage (key e.g. 'openid') → upsert into users. Phone login
+goes through the phoneLogin cloud function (decrypts getPhoneNumber). Queries
+on users must tolerate both openid field namings (_openid).
+
+═══════════════════════════════════════════
+Chapter 3 · Data Contracts (field by field — copy verbatim)
+═══════════════════════════════════════════
+
+## 3.1 Product wine_products (static data.js fallback + cloud source of truth)
+```
+id: 'wine-001' | 'tea-001'        string key, category prefix
+name: string
+price: number                     member price (default effective branch)
+originalPrice: number             strikethrough price (cloud)
+flashPrice: number                flash price (cloud, 0 = none)
+flashStart / flashEnd: string     flash window ('YYYY-MM-DD HH:mm' or datetime-local)
+packSpecs: [{ name:'6-bottle case', label, size:6, price }]   case specs (optional)
+image: [fileID...]                main images ≤20 (carousel)
+images: [fileID...]               detail images ≤20 (separate from main)
+category: 'Baijiu|Tea|Red|Beverage|Beer|Fruit|Huangjiu|White|Shochu|Whisky'
+tag: string                       marketing corner badge (hot/case/clearance/vintage)
+description: string
+sales: number                     sales count (cloud)
+banner: boolean                   in home carousel (cloud)
+sort: number
+```
+Reference scale: ~190 SKUs across baijiu / tea / red wine / beverages / beer /
+fruit wine / huangjiu / brandy / shochu / whisky.
+
+## 3.2 Stores (utils/stores.js is the single source of truth)
+```
+{ id:'s1', name:'brand + district + 店', address, phone, lat, lng, hours:'08:00-22:00' }
+```
+~16 stores. Note: historical id gaps (e.g. s1-s5 then s11-s21) are a migration
+artifact — do NOT re-sequence; keep H5 data/initialData.ts in sync.
+
+## 3.3 Cart item (services/cart.js)
+```
+{ productId, name, price, originalPrice, points, image, quantity,
+  type:'wine'|..., remarks, packSpec(null|{size,label,price}), storeId,
+  key: productId + '_' + specSize + '_' + storeId }
+```
+Stacking rule: same store + product + spec + remarks → merge quantities.
+Legacy items without storeId belong to the default first store.
+
+## 3.4 Order orders (normalized with redundant fields at createOrder time)
+```
+{ ...passthrough,
+  items: [{ productId, name, price, quantity, points, image, packSpec, size }],
+  deliveryMethod: 'pickup'|'delivery'|'uupt',
+  deliveryLabel: '自提'|'配送',          // redundant, readable in console
+  totalQuantity: number,                // redundant
+  itemNames: 'name(spec)×N、…',          // redundant flat string, console-friendly
+  phone, addressText,                   // redundant from address
+  address: { region[], community, detail, phone, name },
+  customerOpenid,                       // redundant (_openid is the system field)
+  subtotal, shippingFee, discount, couponId, total, pointsTotal,
+  status: 'pending_pay'|'pending_ship'|'in_transit'|'completed'|'cancelled',
+  payStatus, payTime:null, shipTime:null, createTime/createdAt (same value),
+  trackingNo:'', carrier:'',
+  verifyCode, verifyTime,               // pickup verification
+  uuptOrderCode,                        // courier order code
+  refundStatus, refundAmount,           // refund state machine (idempotent)
+  images: []                            // verification photos
+}
+```
+Permission: set orders to "creator read/write only" → staff order-taking MUST
+go through staffApi.listOrders / orderApi.getDetail cloud functions.
+
+## 3.5 Other collections — field essentials
+- users: _openid, phone, username, avatarUrl, bio, points (cumulative), coupons
+- staff: openid, storeId, role('admin'|'staff'), nickname, phone, password,
+  enabled, canSeed
+- inventory: { productId, storeId, stock (by bottle), updatedAt }
+- coupon_templates: { title, type('满减'|'折扣'|'无门槛'), threshold, value,
+  total, claimed, startTime, endTime, enabled, scope };
+  user coupon status: claimable / available / used
+- points_products: { name, points, image, stock, enabled }
+- points_log: { userId, delta(±), type, orderId, remark, createdTime }
+- reviews: { orderId, productId, userId, rating(1-5), content, tags[],
+  images[], reply, createdTime } — one per order-item
+- return_requests: { orderId, storeId, userId, reason, type('return'|'exchange'),
+  method('store'|'express'|'courier'), status('pending'|'approved'|'rejected'|
+  'received'), courierFee, images[], address, createdTime, refundId }
+- rankings: { title, desc, type, items[{productId,name,sales,rank}], enabled }
+- ads: { title, image, productId, position('home-carousel'|'home-ad'|'popup'|
+  'clearance'), enabled, startTime, endTime }
+- notices / activities: { title, content/image, enabled, createdTime }
+  (activities also has themeStyle, goods[])
+- card_banner: { image, link } (banner above the membership card + annual ranking)
+- cards: { cardNo, pwd (encrypted), kindId, value, status('inactive'|'activated'|
+  'redeemed'|'frozen'), activateTime, storeId, holderOpenid }
+- card_kinds: { name, faceValue, price, total, sold }
+- card_trades: { cardNo, storeId, orderId, amount, time, operator }
+- invoices: { userId, orderId, title, titleType('personal'|'company'), taxNo,
+  email, status('pending'|'verified'|'rejected'), createdTime }
+- store_settings: { storeId, closeTimes[], openTimes[], updatedAt }
+
+═══════════════════════════════════════════
+Chapter 4 · utils/services — Function Signatures File by File
+═══════════════════════════════════════════
+
+## utils/price.js (single pricing source — every page must use it)
+```
+getEffectivePrice(p) → { price, isFlash, memberPrice }
+  flashPrice>0 and now∈[flashStart,flashEnd] → flashPrice, isFlash=true
+  (window parsing tolerates both 'YYYY-MM-DD HH:mm' and datetime-local 'T')
+getOriginalPrice(p) → originalPrice > effective ? originalPrice : 0
+```
+
+## utils/membership.js
+```
+MEMBERSHIP_TIERS = [Basic(0 pts, slate gradient), VIP(100001, deep-blue), Diamond(1500001, purple)]
+  each: { name,title,minPoints,gradient,borderColor,textColor,metaColor,glowColor,
+         logoIcon,pointColor,rarity,rarityBadgeClass,description,privileges[] }
+getMembershipDetails(points) → { activeTier, nextTier }
+getTierGradientStyle(tier) → css gradient string
+calcPoints(items) → premium categories (matched by name keyword) 1 pt per ¥1;
+  everything else 5 pts per ¥1; Math.floor
+```
+
+## utils/cloud.js (single cloud-DB gateway, auto-isolated by _openid)
+```
+ENV constant; getDB()
+Favorites: uploadFavorites (full replace) loadFavorites addFavorite removeFavorite
+History:   addHistory loadHistory removeHistory clearHistory
+Addresses: loadAddresses addAddress updateAddress removeAddress
+Orders:    createOrder (normalize per 3.4) loadOrders(status) updateOrderStatus
+Users:     createOrUpdateUser
+Coupons:   loadUserCoupons claimCoupon markCouponUsed
+Points:    addPointsLog loadPointsLog
+Returns:   addReturnRequest loadReturnRequests
+Cart:      syncCart loadCart
+Inventory: loadInventory getStock adjustStock setStock deductStocks batchGetStock
+```
+
+## utils/imgutil.js (image URLs — same logic as the cloud side)
+```
+encPath(p)         URL-encode Chinese/spaces; pass through already-encoded
+                   (contains %XX) or pure-ASCII strings
+cloudIdToHttps(id) cloud:// → https://<appid>.tcb.qcloud.la/<path> permanent link
+  accepts cloud://<appid>/<path> and cloud://<envid>.<appid>/<path>
+  (last segment is the appid); tolerates dirty data with an embedded
+  .tcb.qcloud.la/ path; on failure returns the input (image binderror fallback)
+```
+
+## utils/pinyin-search.js
+```
+enhanceProducts(products)  element-level idempotent (skip when p._py exists):
+  p._py  = lowercase full pinyin, no spaces (non-Chinese kept as-is)
+  p._pys = lowercase initials
+Match name / _py / _pys. Vendored libs/pinyin-pro.js, no build step.
+Cloud product cache 10 min + refreshGoodsIfStale (60s throttle).
+```
+
+## utils/stores.js / images.js / avatars.js
+```
+stores.js:  STORES array (see 3.2) + distance-sorting helpers
+images.js:  DEFAULT_IMAGE = '/images/placeholder.jpg'
+avatars.js: SYSTEM_AVATARS — array of 8 cloud-hosted avatar paths
+```
+
+## services/cart.js (cross-store cart)
+```
+currentStoreId()   effective store = manual > geo > default first
+getCartItems(storeId?)  addToCart(item) (stacking rule per 3.3)
+removeCartItem / removeCartItemByKey / clearCart / getCartCount / updateCartBadge
+```
+
+## services/coupons.js
+```
+syncCouponStatus()  sync cloud records into local claimable/available/used
+claimCoupon / availability filtering (threshold / validity / used)
+```
+
+═══════════════════════════════════════════
+Chapter 5 · Cloud Functions, One by One (30)
+═══════════════════════════════════════════
+
+Convention: `exports.main = async (event) => { switch(event.action){...} }`,
+returning `{ ok:true, data }` / `{ ok:false, err }`. Deploy order: Chapter 8.
+
+## ★ adminApi (admin core, the largest)
+auth(event):
+  super = dedicated account (env ADMIN_SUPER_ACCOUNT) + ADMIN_SUPER_PASSWORD
+    → role:'super'
+  admin/staff = phone + password matched against the staff collection
+    → role:'admin'|'staff', storeId
+Permission matrix (do not change): super = all stores + staff management;
+card kinds / card lists / ads / coupons / points products / products /
+locations / web groups are super-only; store-bound admin = own store's
+orders/returns/inventory/close-store/gift cards/receipt printer; an admin
+with no store is treated as super; consoles always force the bound store.
+actions (grouped):
+  Auth:        login
+  Products:    listProducts | h5Goods (paged) | h5GoodsSave | h5GoodsDelete |
+               h5GoodsToggle | h5GoodsExport (CSV with Chinese headers — the
+               export IS the import template) | h5GoodsImport (match-and-update
+               by id, NO delete semantics) | h5GoodsImages | h5SetProductImage |
+               uploadImage | uploadFile
+  Orders:      h5Orders | h5OrderDetail | h5OrderOp | h5OrdersExport |
+               h5SalesReport | h5CloseTimes
+  Returns:     h5Returns | h5ReturnOp
+  Inventory:   h5Stock | h5StockSet | h5StockUpdate
+  Staff:       h5Staff | h5StaffAdd | h5StaffUpdate | h5StaffRemove |
+               h5StaffCandidates (mini-program users eligible to become staff) |
+               h5StaffMigrate
+  Stores:      h5Stores | h5SetCloseTime | h5SetOpenTime
+  Content:     h5Notices/h5NoticeSave/h5NoticeDelete | listActivities/
+               saveActivity/deleteActivity/toggleActivity | h5Ads/h5AdsSave/
+               h5AdsDelete/h5AdsToggle | h5RankingList/h5RankingSave/h5RankingDelete
+  Public reads (BEFORE auth checks): pubNotices | pubActivities | pubAds |
+               pubRankings (joined with products)
+  Coupons:     listCoupons | saveCoupon | deleteCoupon | toggleCoupon
+  Points shop: pointsList | pointsSave | pointsDelete | pointsToggle
+  Gift cards:  cardLogin | cardKindList | cardKindSave | cardKindDelete |
+               cardBatchCreate (batch issue) | cardList (card-number search uses
+               a server-side regex in the where clause) | cardBatchDelete |
+               cardBatchSetPwd | cardActivate | cardUnactivate | cardCancel |
+               cardReset | cardSetPassword | cardVerify | cardShip | cardStores |
+               cardComplete | cardDelete | cardSubmitTrade | cardTradesList |
+               cardTradeDelete | cardExport | cardExportTrades | cardMigrate |
+               h5CardBannerGet | h5CardBannerSave
+  Invoices:    h5InvoiceList | h5InvoiceIssue | h5InvoiceDelete
+  Misc:        debug | adMigrateImages
+Env vars: ADMIN_SUPER_ACCOUNT / ADMIN_SUPER_PASSWORD / ADMIN_SUPER_KEY /
+  ADMIN_H5_PASSWORD / CARD_ENC_KEY
+**New actions go INSIDE the main try block**, or they 404 after deploy.
+
+## ★ productApi (products, client side)
+list (public, paged + filtered) / get (detail) / add / update / delete /
+banner (home carousel). Admin ops check the ADMIN_PASSWORD env var. Contains
+cloudIdToHttps (same as imgutil).
+
+## ★ inventoryApi (inventory)
+get / list / batchGet / set / adjust / addBack (return restock) / deduct /
+deductBatch (batch; reject the WHOLE order if any item is short) /
+findStores (which stores stock a product).
+Semantics: 0 = out of stock, >0 = in stock, no record = sold out.
+
+## ★ payApi (WeChat Pay V3)
+actions: query (order query / post-pay confirm) | refund | courierFee |
+queryCourierFee
+Refund rules: before shipment full refund including shipping; after shipment
+goods only, never shipping; claw back granted points; refundStatus state
+machine + unique outRefundNo = idempotent.
+Env vars: MCHID / WXPAY_APPID / WXPAY_SERIAL_NO / WXPAY_API_V3_KEY
+
+## ★ payNotify (payment callback, called by WeChat, no action)
+V3 signature verification (cert serial + APIv3 key) → decrypt resource → mark
+order paid → deductBatch stock → calcPoints + points_log → staff new-order
+subscribe message → (H5 polls and prints).
+
+## ★ orderApi / staffApi (staff side)
+orderApi: getDetail (only same-store staff or the customer) / listByStore /
+  setVerifyCode / uploadImages
+staffApi: add/remove/toggle/list/setStore/setNickname/myStore/
+  listOrders (store orders — the staff console polls this every 30s)/
+  updateOrder (status transitions)/canSeed (seed permission)/seedAdmin
+Order state machine: pending_pay → pending_ship → in_transit → completed
+(+cancelled / refund branch)
+
+## ★ pointsApi / reviewsApi / returnApi
+pointsApi: list / exchange (validates balance) / myExchanges / logPoints /
+  myLogs / deductForOrder / refundForOrder
+reviewsApi: submit (one per order-item) / byProduct / checkOrder /
+  msgCheck+mediaCheck+riskCheck (content safety — only "risky" blocks);
+  displayed rating = (5 + average) / 2
+returnApi: list / approve / reject / receive (refund after goods received)
+
+## ★ uuptApi + uuptCallback (local courier)
+uuptApi actions: price (quote) / create / quickCreate / cancel / cancelFee /
+  account / rechargeUrl / detail / track / dispatchOrder / gratuity / sync
+Sign per the official OpenAPI (appId+appKey+timestamp). Fare rule (base fare +
+base distance + per-km surcharge + cap) is ALWAYS recomputed server-side — the
+frontend only displays it. Courier returns are prepaid by the customer — never
+freight-collect.
+Env vars: UUPT_APP_ID / UUPT_APP_KEY / UUPT_BASE / UUPT_CALLBACK_URL /
+UUPT_OPEN_ID
+
+## ★ serviceApi + sendSubscribeMsg (notifications)
+serviceApi: bind/getBind/getOAuthUrl/oauth/genQrCode/sendTemplate/
+  notifyNewOrder/notifyReject; relayed through a server-side PHP file
+  (IP whitelist). Env: SERVICE_APPID/SERVICE_APPSECRET/SERVICE_TOKEN/
+  SERVICE_BASE/SEND_HOST
+sendSubscribeMsg: userOrderStatus/userRefund/userAppointment/staffNewOrder/
+  staffReturn/staffAppointment. Env: MINI_APPID/MINI_APPSECRET.
+Triggers: order placed → staffNewOrder; status change → userOrderStatus;
+refund → both sides.
+
+## Utility cloud functions
+storeApi (getCloseTimes/setCloseTime) | invoiceApi (myAvailableOrders/submit/
+myList/h5Issue/h5List, env ADMIN_PWD) | getOpenid (returns wxContext directly) |
+phoneLogin (decrypt phone → upsert users) | mpVerify (content-safety stub) |
+reverseGeocode (lat/lng → address, for home-page geo) | syncData |
+importProducts/batchImport (bulk product import: import/count/reset) |
+priceUpdate (bulk pricing / flash windows) | ordersBackfill (historical
+backfill) | fixSpaceFiles (fix cloud-storage paths containing spaces:
+scan/fixOne/updateDB) | initDB (create collections/indexes) | h5admin (HTTP
+gateway relaying to adminApi, called by the PHP relay)
+
+═══════════════════════════════════════════
+Chapter 6 · Business Rules (change one, break everything)
+═══════════════════════════════════════════
+1. Three-branch pricing: flash price (inside window) > member price;
+   strikethrough only when original > effective; case sale = packSpecs.
+   Display / cart / order / checkout ALL go through utils/price.js.
+2. Inventory: 0 out / >0 in / no record sold out; deduction only in the payment
+   callback via deductBatch (reject whole order on shortage); case items deduct
+   by bottle = qty × spec size; effective store = manual > geo > default first.
+3. Shipping: pickup 0; delivery free when subtotal ≥ 200, otherwise flat 6
+   (distance-based extensible); checkout shows "X more for free shipping"
+   (freeShipGap = 200 − subtotal).
+4. Cross-store cart: items bind storeId; key = product+spec+store; settle one
+   store at a time (grouped chained createOrder); sync on store switch in
+   onShow; legacy no-store items belong to the first store.
+5. Order state machine: pending_pay→pending_ship→in_transit→completed
+   (+cancelled/refund). Pickup orders use verifyCode + photos (images).
+6. Permissions: see the adminApi matrix — do not "fix" it.
+7. Points: premium keyword categories 1 pt/¥1, others 5 pt/¥1; tiers at
+   0 / 100001 / 1500001; refunds claw points back.
+8. Refunds: pre-shipment full incl. shipping; post-shipment goods only;
+   idempotent.
+9. Reviews: one per order-item; content safety blocks only "risky"; rating =
+   (5+avg)/2.
+10. Images: always convert to tcb.qcloud.la permanent links + encPath; ≤20
+    main and ≤20 detail images; keep existing images when an edit uploads
+    none; 404 = re-upload; 451 = CloudBase frozen for non-payment (top up).
+11. Courier: fare recomputed server-side; courier returns prepaid by customer.
+12. Public pub* endpoints (notices/activities/ads/rankings) live BEFORE auth
+    checks; the frontend fetches on tab switch and falls back to static data.
+13. Gift cards: card-number search = server-side regex in where; secrets
+    encrypted with an env key; state machine inactive→activated→redeemed/frozen.
+14. Pinyin search: element-level _py idempotency; cloud cache 10 min + 60s
+    throttle.
+
+═══════════════════════════════════════════
+Chapter 7 · Page-by-Page Specs (31 pages)
+═══════════════════════════════════════════
+(Each page = 4 files under pages/<name>/; every page carries cartCount in data
+and refreshes in onShow; custom-nav pages use app.globalData.statusBarHeight
+for the top inset)
+
+## Tab pages
+1. **index home**: geolocation (map SDK + reverseGeocode) → activeStore/
+   nearbyStore; category grid; banner carousel (pubAds home-carousel slot);
+   hot sellers; rankings entry; popup ad (showAdPopup/adImage/adProductId →
+   detail); fly-to-cart animation (buyItem/cartGif/flyGoods); stock via
+   batchGet → stockMap
+2. **category**: store-switch half-sheet (showStoreSheet, distance-sorted);
+   two-level categories (mainCategories/subCategories); pinyin keyword search;
+   filters (sortBy/priceMin/priceMax/showFilter); result count; direct checkout
+3. **cart**: cross-store grouping; selection (selectedIds/selectAll); totals
+   (totalPrice/pointsTotal/availableCoupons/appliedCoupon/discountedTotal);
+   pickup modal showPickupModal; stock refresh via list
+4. **membership**: Memphis-style tier card (getTierGradientStyle); points
+   progress bar progressWidth; tier roadmap showRoadmap; claimable coupons
+5. **profile**: login state / role badges (isStaff/isAdmin/canSeed); system
+   avatar picker (showAvatarModal+sysAvatars); feature-entry matrix (orders/
+   coupons/points/favorites/history/addresses/returns/rankings/staff console/
+   admin console)
+
+## Transaction chain
+6. **wine-detail**: main-image carousel = full image array; detail images
+   rendered separately; favorite heart animation; packSpecs case picker;
+   multi-store stock storeStocks (findStores); sold-out modal soldOutModal
+   (soldOutStores); review aggregation (reviewAvg/featuredReview);
+   add-to-cart / buy-now
+7. **checkout**: grouped chained createOrder per store; points items via
+   pointsApi deductForOrder; address pick/create; coupon sheet
+   (usable/unusable); free-shipping gap freeShipGap; delivery method
+   (pickup/delivery/courier + uuptApi price quote); remark; submit → to-pay
+8. **to-pay**: order list + countdown; wx.requestPayment (confirm via payApi
+   query); cancel order; on success deductBatch + staffNewOrder subscribe msg
+9. **to-ship / to-receive**: status-filtered lists; refund entry (payApi refund)
+10. **order-detail**: status machine display (statusText/deliveryLabel);
+    verifyCode; review entry (reviewsApi checkOrder); courier track
+    (uuptApi track → uuptSteps/uuptMap)
+11. **order-track / uupt-track**: order tracking list; courier map
+    (markers/polyline/driverName/driverMobile/etaText)
+
+## Personal / marketing
+12. **address**: address CRUD + validation (phoneValid/formErrors) + region picker
+13. **coupons**: tabs usable/unusable/claimed; claimCoupon
+14. **points**: transaction list; tier progress; detail modal
+15. **points-mall**: pointsApi list/exchange
+16. **favorites / browse-history**: lists + batchGet stock refresh; history
+    grouped today/earlier + clear-all
+17. **edit-profile**: nickname/avatar/bio editing
+18. **invite**: invite poster image
+19. **activity**: activity page (themeStyle theming, actGoods)
+20. **stores**: store list + keyword search
+21. **ranking**: pop-art narrative style (brand blue + halftone dots +
+    black-edged hard shadows + clashing colors); rankTabs multi-rankings;
+    pubRankings public read; banner fallback
+22. **review-write**: star animation, tags, image upload (mediaCheck),
+    msgCheck/riskCheck then submit
+23. **review-list**: byProduct list + average rating (rule 9 formula)
+24. **return-exchange**: type (return/exchange), reason, method
+    (store/express/courier-prepaid quote), appeal image upload, my requests list
+25. **return-audit** (manager): approve/reject/receive+refund
+
+## Management consoles
+26. **store-staff**: myStore → poll listOrders every 30s; tabs
+    (pending-prep/in-transit/completed); updateOrder transitions; verification
+    code input; subscribe-message toggle
+27. **store-admin**: tabs (orders/inventory/staff/close-store/returns/
+    products); staff CRUD (seedAdmin/canSeed); inventory adjust; close-store
+    setCloseTime; verification setVerifyCode+uploadImages
+28. **service-bind**: web-view embedding the service-account OAuth bind page
+
+## Hidden pages (NOT registered in app.json)
+29. **invoice-apply / invoice-list**: invoiceApi myAvailableOrders/submit/myList
+
+═══════════════════════════════════════════
+Chapter 8 · Components / H5 / Printing / Deployment / Data Import
+═══════════════════════════════════════════
+
+## Components
+- qty-modal: spec + quantity picker (globally registered in app.json)
+- loading-lottie: Lottie loading animation
+
+## H5 brand site + admin (h5-app)
+React 18 + Vite + Tailwind v4, one page with lazily loaded tabs: Home /
+Notice / Activities / Stores (map JS API, 2D/3D) / Admin / Footer (ICP filing).
+API layer: fetch → server PHP relay → h5admin cloud function → adminApi.
+(The PHP file lives only on the server, not in the repo — do not overwrite.)
+Login: super = dedicated account (phone left empty); admin/staff = phone+password.
+Roles: super sees global modules; store managers see only their store.
+On new orders the admin POSTs to http://127.0.0.1:8899/print; notification
+sounds are local too.
+
+## Print service (print-server)
+Node http service, port 8899:
+  POST /print { _id, storeId, ... } → pick printer by store mapping → ESC/POS →
+  receipt
+  GET /printers | GET/POST /config (store→printer map {default, map:{s1:'...'}})
+  | POST /test | GET /status | POST /autodetect
+Ops: auto-start + keep-alive scripts; stop the old service first (port
+conflict); save Chinese .bat files in GBK; use the Unrestricted execution
+policy for .ps1; ship an antivirus-whitelist guide.
+
+## Deployment (in order)
+1. Create the mini program + CloudBase env; replace AppID / env ID / direct-
+   link domain globally
+2. Deploy cloud functions in dependency order: getOpenid → initDB → productApi
+   → inventoryApi → adminApi → payApi/payNotify → orderApi/staffApi → pointsApi
+   → reviewsApi → returnApi → serviceApi/sendSubscribeMsg → uuptApi/
+   uuptCallback → invoiceApi → utility functions
+3. Configure env-var groups (fill at deploy time, never in code):
+   adminApi super group / payApi+payNotify payment quartet / uuptApi courier
+   quintet / serviceApi service-account group / sendSubscribeMsg mini-program
+   pair / admin passwords
+4. Create the 21 collections; set orders to "creator read/write only"
+5. WeChat Pay V3: merchant private key + serial + APIv3 key; callback route →
+   payNotify
+6. Subscribe-message template IDs go in sendSubscribeMsg
+7. Build & deploy H5 + PHP relay; inject the map key into the page
+8. Install the print service at stores; configure printer mappings
+9. **Data import**: products via Excel → importProducts pipeline (or
+   h5GoodsImport CSV — match-by-id update, no deletes, export = template);
+   stores go into stores.js + sync H5; product images to cloud storage
+   (≤20 main / ≤20 detail per SKU); gift cards via cardBatchCreate
+10. End-to-end: order → pay → stock deduction → staff accept → verify → refund
+    → points → review → rankings → gift card → courier
+
+═══════════════════════════════════════════
+Chapter 9 · Pitfalls (hard-earned)
+═══════════════════════════════════════════
+- Re-read .wxss from disk before editing + balance braces; delete style blocks
+  with exact matches
+- Record original values before tests mutate real data; restore afterwards
+- Historical store-id gaps are a migration artifact — do not re-sequence
+- A React context missing a value prop → blank page (tsc passes, runtime
+  crashes); after adding a field, grep the value block
+- Cloud DB client limit 100 → paginate with skip; _.in limited to 20 → batch;
+  querying users by openid must tolerate _openid
+- New adminApi actions go inside the main try block, or they 404 after deploy
+- Local printing / notification sounds use 127.0.0.1 — store machines only
+- 451 = CloudBase frozen for non-payment; top up — not a code bug
+- Product CSV import = match-and-update by id, no deletes; the export IS the
+  import template
+
+═══════════════════════════════════════════
+Chapter 10 · Acceptance Checklist
+═══════════════════════════════════════════
+- Compile in DevTools after every batch; capture real-device screenshots of
+  the full flow
+- Verify permission boundaries in the admin with BOTH super and store-manager
+  roles
+- Payment / refund / courier all pass in sandbox before launch
+- Pages: 31 registered + 2 hidden; 5 tabs; badges/modals/animations checked
+  one by one
+
 Customer (WeChat Mini Program) → Cloud Functions (30) → Cloud DB (21 collections) + Cloud Storage
                                → WeChat Pay V3 / local courier API / subscribe messages / content safety
 H5 brand site + admin (React+Vite) → PHP relay → cloud function gateway
